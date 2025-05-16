@@ -20,37 +20,12 @@ from interactive_rfp_agent import (
 st.set_page_config(page_title="Interactive RFP Agent", layout="wide")
 
 # --- API Key Management ---
-st.sidebar.title("API Configuration")
-st.sidebar.info(
-    "For deployed apps, use Streamlit Secrets (e.g., create a .streamlit/secrets.toml file).\n"
-    "PINECONE_API_KEY = \"your_pinecone_key\"\n"
-    "PINECONE_HOST = \"your_pinecone_host\"\n"
-    "OPENAI_API_KEY = \"your_openai_key\"\n\n"
-    "For local development, you can enter them here. Values from secrets will be used if available."
-)
+# API keys are now exclusively managed by Streamlit Secrets for deployed apps.
+# Ensure PINECONE_API_KEY, PINECONE_HOST, and OPENAI_API_KEY are set in Streamlit Cloud dashboard.
 
-# Try to get secrets first, then allow override via text input
-pinecone_api_key_val = st.secrets.get("PINECONE_API_KEY", "")
-pinecone_host_val = st.secrets.get("PINECONE_HOST", DEFAULT_PINECONE_HOST)
-openai_api_key_val = st.secrets.get("OPENAI_API_KEY", "")
-
-pinecone_api_key_input = st.sidebar.text_input(
-    "Pinecone API Key", 
-    type="password", 
-    value=pinecone_api_key_val,
-    help="Your Pinecone API key."
-)
-pinecone_host_input = st.sidebar.text_input(
-    "Pinecone Host URL", 
-    value=pinecone_host_val,
-    help="Your Pinecone index host URL."
-)
-openai_api_key_input = st.sidebar.text_input(
-    "OpenAI API Key", 
-    type="password", 
-    value=openai_api_key_val,
-    help="Your OpenAI API key."
-)
+pinecone_api_key = st.secrets.get("PINECONE_API_KEY")
+pinecone_host = st.secrets.get("PINECONE_HOST", DEFAULT_PINECONE_HOST) # Allow default host if not in secrets
+openai_api_key = st.secrets.get("OPENAI_API_KEY")
 
 # --- Main App ---
 st.title("Interactive RFP Agent")
@@ -58,18 +33,20 @@ st.caption("Answering your RFP questions. Type 'new' to reset. First query gets 
 
 # Initialize RFPQueryEngine
 engine = None
-if pinecone_api_key_input and pinecone_host_input:
+if pinecone_api_key and pinecone_host:
     try:
         engine = RFPQueryEngine(
-            pinecone_host=pinecone_host_input,
-            pinecone_api_key=pinecone_api_key_input,
-            openai_api_key=openai_api_key_input if openai_api_key_input else None
+            pinecone_host=pinecone_host,
+            pinecone_api_key=pinecone_api_key,
+            openai_api_key=openai_api_key if openai_api_key else None
         )
     except Exception as e:
         st.error(f"Failed to initialize RFP Query Engine: {e}")
         st.stop()
 else:
-    st.warning("Please provide Pinecone API Key and Host URL in the sidebar to start.")
+    st.error("Required API secrets (PINECONE_API_KEY, PINECONE_HOST) not found. "
+             "Please configure them in your Streamlit Cloud app settings.")
+    st.sidebar.warning("Ensure PINECONE_API_KEY and PINECONE_HOST are set in your Streamlit app secrets.")
     st.stop()
 
 # Initialize session state variables
@@ -138,7 +115,7 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
 
         if st.session_state.is_first_query:
             perform_search_this_turn = True
-            st.info("Applying initial context scaffold for Pinecone searches (first query of session).")
+            # Info message about scaffolding is now part of the assistant's turn display below
             query_for_general_searches = SCAFFOLDING_PROMPT_FOR_PINECONE_TEMPLATE.replace(SCAFFOLDING_PLACEHOLDER, prompt)
             raw_user_query_for_qa = prompt 
         elif prompt.lower().startswith("search "): 
@@ -150,55 +127,59 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                 st.session_state.messages.append({"role": "assistant", "content": "Please provide a query after 'search '.", "type": "info"})
                 st.stop() 
             
-            st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
             query_for_general_searches = actual_search_term 
             raw_user_query_for_qa = actual_search_term      
         else: 
-            st.info("Using existing Pinecone context. To force a new search, prefix your query with 'search '.")
+            # No st.info here for "Using existing context", it will be part of assistant's message if no search
 
-        if perform_search_this_turn:
-            try:
-                with st.spinner("Searching Pinecone..."):
-                    all_search_results = engine.search(query_for_general_searches, raw_user_query_for_qa)
-                    current_pinecone_results_for_display = format_results_for_display(all_search_results)
-                    new_pinecone_context_for_llm = ""
-                    for search_name, data_items in all_search_results.items():
-                        new_pinecone_context_for_llm += f"\nContext from '{search_name}':\n"
-                        if data_items:
-                            for i, data_item in enumerate(data_items, 1):
-                                content = getattr(data_item, 'text', "")
-                                metadata = getattr(data_item, 'metadata', {})
-                                source = metadata.get('source') or metadata.get('filename') or metadata.get('title') or search_name
-                                new_pinecone_context_for_llm += f"  Result {i} (source: {source}): {content}\n"
-                        else:
-                            new_pinecone_context_for_llm += "  No results found.\n"
-                    st.session_state.last_pinecone_context = new_pinecone_context_for_llm
-                    assistant_response_message["pinecone_results_str"] = current_pinecone_results_for_display
-                    # No need to display Pinecone results immediately here if it's done in the history loop
-                    # However, for user experience, showing it in an expander for the current turn is good.
-                    # This expander will be shown *before* the LLM response for the current turn.
-                    if current_pinecone_results_for_display: # Only show if there are results
-                        with st.expander("View Pinecone Search Results (Current Query)", expanded=True):
-                            st.markdown(current_pinecone_results_for_display)
-                    
-                    # CRITICAL: Set is_first_query to False *after* a successful search for the first query has completed.
-                    if st.session_state.is_first_query: 
-                        st.session_state.is_first_query = False
-
-            except Exception as e:
-                st.error(f"Error during Pinecone search: {e}")
-                assistant_response_message["error_message"] = f"Error during Pinecone search: {e}"
-                st.session_state.messages.append({"role": "assistant", **assistant_response_message})
-                st.stop() 
-
-        llm_input_user_requirement = st.session_state.llm_conversation_history
-        if llm_input_user_requirement:
-            llm_input_user_requirement += "\n\n"
-        llm_input_user_requirement += f"User: {prompt}"
-
-        llm_output_str = ""
+        # Perform operations within the assistant's chat message context where appropriate
         with st.chat_message("assistant"):
-            if openai_api_key_input:
+            if st.session_state.is_first_query and perform_search_this_turn:
+                st.info("Applying initial context scaffold for Pinecone searches (first query of session).")
+            elif prompt.lower().startswith("search ") and perform_search_this_turn:
+                st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
+            elif not perform_search_this_turn and not (prompt.strip().lower() == "new") : # Avoid double message for "new"
+                 st.info("Using existing Pinecone context. To force a new search, prefix your query with 'search '.")
+
+            if perform_search_this_turn:
+                try:
+                    with st.spinner("Searching Pinecone..."):
+                        all_search_results = engine.search(query_for_general_searches, raw_user_query_for_qa)
+                        current_pinecone_results_for_display = format_results_for_display(all_search_results)
+                        new_pinecone_context_for_llm = ""
+                        for search_name, data_items in all_search_results.items():
+                            new_pinecone_context_for_llm += f"\nContext from '{search_name}':\n"
+                            if data_items:
+                                for i, data_item in enumerate(data_items, 1):
+                                    content = getattr(data_item, 'text', "")
+                                    metadata = getattr(data_item, 'metadata', {})
+                                    source = metadata.get('source') or metadata.get('filename') or metadata.get('title') or search_name
+                                    new_pinecone_context_for_llm += f"  Result {i} (source: {source}): {content}\n"
+                            else:
+                                new_pinecone_context_for_llm += "  No results found.\n"
+                        st.session_state.last_pinecone_context = new_pinecone_context_for_llm
+                        assistant_response_message["pinecone_results_str"] = current_pinecone_results_for_display
+                        
+                        if current_pinecone_results_for_display:
+                            with st.expander("View Pinecone Search Results (Current Query)", expanded=True):
+                                st.markdown(current_pinecone_results_for_display)
+                        
+                        if st.session_state.is_first_query: 
+                            st.session_state.is_first_query = False
+
+                except Exception as e:
+                    st.error(f"Error during Pinecone search: {e}")
+                    assistant_response_message["error_message"] = f"Error during Pinecone search: {e}"
+                    st.session_state.messages.append({"role": "assistant", **assistant_response_message})
+                    st.stop() 
+
+            llm_input_user_requirement = st.session_state.llm_conversation_history
+            if llm_input_user_requirement:
+                llm_input_user_requirement += "\n\n"
+            llm_input_user_requirement += f"User: {prompt}"
+
+            llm_output_str = ""
+            if openai_api_key: # Check if OpenAI key is available from secrets
                 if not st.session_state.last_pinecone_context and not perform_search_this_turn:
                     st.warning("No Pinecone context from previous searches is available. LLM response may be general.")
                 
@@ -209,7 +190,7 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                         current_llm_system_prompt,
                         llm_input_user_requirement, 
                         st.session_state.last_pinecone_context, 
-                        openai_api_key_input
+                        openai_api_key # Use directly fetched secret
                     )
                 
                 assistant_response_message["final_llm_output"] = llm_output_str
@@ -226,11 +207,10 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                     st.markdown("##### Agent's Response") 
                     st.markdown(llm_output_str)
 
-            else:
-                st.warning("OpenAI API Key not provided. Skipping final synthesis.")
-                llm_output_str = "OpenAI API Key not provided. Cannot generate final response."
+            else: # OpenAI API Key not found in secrets
+                st.warning("OpenAI API Key not found in secrets. Skipping final synthesis.")
+                llm_output_str = "OpenAI API Key not found. Cannot generate final response."
                 assistant_response_message["final_llm_output"] = llm_output_str
-                # Display this warning directly
                 if expect_json_response_this_turn:
                     st.markdown("##### Synthesized JSON Response") 
                     st.code(llm_output_str, language="text")
@@ -238,21 +218,28 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                     st.markdown("##### Agent's Response") 
                     st.markdown(llm_output_str)
 
-        # Update LLM conversation history
-        agent_explanation_for_history = "LLM response not processed or explanation unavailable."
-        if llm_output_str:
-            if expect_json_response_this_turn:
-                try:
-                    parsed_json = json.loads(llm_output_str)
-                    if isinstance(parsed_json, dict):
-                        agent_explanation_for_history = parsed_json.get("explanation", "No explanation in JSON.")
-                    else: 
-                        agent_explanation_for_history = str(parsed_json) 
-                except json.JSONDecodeError:
-                    agent_explanation_for_history = llm_output_str # Use raw string if not JSON
-            else: # For conversational follow-ups, the whole output is the explanation
-                agent_explanation_for_history = llm_output_str
-        
-        st.session_state.llm_conversation_history = llm_input_user_requirement + f"\nAgent: {agent_explanation_for_history}"
+            # Update LLM conversation history
+            agent_explanation_for_history = "LLM response not processed or explanation unavailable."
+            if llm_output_str:
+                if expect_json_response_this_turn:
+                    try:
+                        parsed_json = json.loads(llm_output_str)
+                        if isinstance(parsed_json, dict):
+                            agent_explanation_for_history = parsed_json.get("explanation", "No explanation in JSON.")
+                        else: 
+                            agent_explanation_for_history = str(parsed_json) 
+                    except json.JSONDecodeError:
+                        agent_explanation_for_history = llm_output_str
+                else: # For conversational follow-ups, the whole output is the explanation
+                    agent_explanation_for_history = llm_output_str
+            
+            st.session_state.llm_conversation_history = llm_input_user_requirement + f"\nAgent: {agent_explanation_for_history}"
+            # Append the complete assistant message (which now includes UI elements directly printed in the with block)
+            # to history *after* the with st.chat_message("assistant") block has completed.
+            # The actual UI elements (st.info, st.spinner, st.markdown, st.json, st.code, st.expander) are rendered 
+            # when they are called. Adding to st.session_state.messages ensures they are part of the scrollback history correctly.
+            # We only need to add the *data* that the history rendering loop uses.
+            
+        # This should be outside the `with st.chat_message("assistant")` block if that block only handles immediate display
         st.session_state.messages.append({"role": "assistant", **assistant_response_message})
         # Streamlit reruns, redrawing messages

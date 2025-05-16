@@ -1,0 +1,5 @@
+streamlit
+requests
+openai
+langchain-core
+# langflow # Optional, uncomment if you install and want full langflow Data objects 

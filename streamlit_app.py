@@ -122,33 +122,32 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
         elif prompt.lower().startswith("search "): 
             perform_search_this_turn = True
             actual_search_term = prompt[len("search "):].strip()
-            if not actual_search_term:
-                # This warning will be displayed within the upcoming assistant message block
-                pass # Handled in the with st.chat_message("assistant") block
-            else:
+            # actual_search_term being empty is handled inside the assistant message block
+            if actual_search_term: # Only set these if search term is non-empty
                 query_for_general_searches = actual_search_term 
                 raw_user_query_for_qa = actual_search_term      
-        else: 
-            # No st.info here for "Using existing context", it will be part of assistant's message if no search
+        # Note: The 'else' for 'Using existing context' is handled by perform_search_this_turn being false
 
-        # Perform operations within the assistant's chat message context where appropriate
+        # All assistant rendering for the current turn happens inside this block
         with st.chat_message("assistant"):
-            # Display informational messages based on search type for this turn
+            # Display informational messages based on the type of query for this turn
             if st.session_state.is_first_query and perform_search_this_turn:
                 st.info("Applying initial context scaffold for Pinecone searches (first query of session).")
-            elif prompt.lower().startswith("search ") and perform_search_this_turn:
-                if not actual_search_term: # Handle empty search term case here
+            elif prompt.lower().startswith("search "): # This implies perform_search_this_turn is True from logic above
+                if not actual_search_term: # Specifically handle if user typed "search " then nothing
                     st.warning("Please provide a query after 'search '.")
-                    # Store this warning in the message history and stop further processing for this turn.
-                    assistant_response_message["type"] = "info" # Mark as an info/warning message
+                    # Update assistant_response_message for history
+                    assistant_response_message["type"] = "info"
                     assistant_response_message["final_llm_output"] = "Please provide a query after 'search ' to initiate a new search."
+                    # Add to main history immediately and stop this turn's processing
                     st.session_state.messages.append({"role": "assistant", **assistant_response_message})
-                    st.stop() # Stop processing for this turn
-                else:
+                    st.stop()
+                else: # actual_search_term is valid
                     st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
-            elif not perform_search_this_turn and not (prompt.strip().lower() == "new") : # Avoid double message for "new"
+            elif not perform_search_this_turn: # This is a follow-up, no "search " prefix
                  st.info("Using existing Pinecone context. To force a new search, prefix your query with 'search '.")
 
+            # Perform Pinecone search if determined necessary for this turn
             if perform_search_this_turn:
                 try:
                     with st.spinner("Searching Pinecone..."):
@@ -174,22 +173,21 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                         
                         if st.session_state.is_first_query: 
                             st.session_state.is_first_query = False
-
                 except Exception as e:
                     st.error(f"Error during Pinecone search: {e}")
                     assistant_response_message["error_message"] = f"Error during Pinecone search: {e}"
-                    # No need to append to messages here, it will be done at the end of the main 'else' block
-                    # However, we do need to store the error in the assistant_response_message for history
                     st.session_state.messages.append({"role": "assistant", **assistant_response_message})
                     st.stop() 
 
+            # Prepare LLM input requirement string
             llm_input_user_requirement = st.session_state.llm_conversation_history
             if llm_input_user_requirement:
                 llm_input_user_requirement += "\n\n"
             llm_input_user_requirement += f"User: {prompt}"
 
+            # Call LLM and display its response
             llm_output_str = ""
-            if openai_api_key: # Check if OpenAI key is available from secrets
+            if openai_api_key: 
                 if not st.session_state.last_pinecone_context and not perform_search_this_turn:
                     st.warning("No Pinecone context from previous searches is available. LLM response may be general.")
                 
@@ -200,12 +198,11 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                         current_llm_system_prompt,
                         llm_input_user_requirement, 
                         st.session_state.last_pinecone_context, 
-                        openai_api_key # Use directly fetched secret
+                        openai_api_key 
                     )
                 
                 assistant_response_message["final_llm_output"] = llm_output_str
                 
-                # Adaptive display for the current turn being processed
                 if expect_json_response_this_turn:
                     st.markdown("##### Synthesized JSON Response") 
                     try:
@@ -216,8 +213,7 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                 else:
                     st.markdown("##### Agent's Response") 
                     st.markdown(llm_output_str)
-
-            else: # OpenAI API Key not found in secrets
+            else: 
                 st.warning("OpenAI API Key not found in secrets. Skipping final synthesis.")
                 llm_output_str = "OpenAI API Key not found. Cannot generate final response."
                 assistant_response_message["final_llm_output"] = llm_output_str
@@ -227,29 +223,27 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                 else:
                     st.markdown("##### Agent's Response") 
                     st.markdown(llm_output_str)
-
-            # Update LLM conversation history
-            agent_explanation_for_history = "LLM response not processed or explanation unavailable."
-            if llm_output_str:
-                if expect_json_response_this_turn:
-                    try:
-                        parsed_json = json.loads(llm_output_str)
-                        if isinstance(parsed_json, dict):
-                            agent_explanation_for_history = parsed_json.get("explanation", "No explanation in JSON.")
-                        else: 
-                            agent_explanation_for_history = str(parsed_json) 
-                    except json.JSONDecodeError:
-                        agent_explanation_for_history = llm_output_str
-                else: # For conversational follow-ups, the whole output is the explanation
+        # End of: with st.chat_message("assistant")
+        
+        # Update LLM conversation history for the next turn
+        agent_explanation_for_history = "LLM response not processed or explanation unavailable."
+        if llm_output_str: # llm_output_str is from the current turn
+            if expect_json_response_this_turn: # From the current turn
+                try:
+                    parsed_json = json.loads(llm_output_str)
+                    if isinstance(parsed_json, dict):
+                        agent_explanation_for_history = parsed_json.get("explanation", "No explanation in JSON.")
+                    else: 
+                        agent_explanation_for_history = str(parsed_json) 
+                except json.JSONDecodeError:
                     agent_explanation_for_history = llm_output_str
+            else: 
+                agent_explanation_for_history = llm_output_str
+        
+        st.session_state.llm_conversation_history = llm_input_user_requirement + f"\nAgent: {agent_explanation_for_history}"
             
-            st.session_state.llm_conversation_history = llm_input_user_requirement + f"\nAgent: {agent_explanation_for_history}"
-            # Append the complete assistant message (which now includes UI elements directly printed in the with block)
-            # to history *after* the with st.chat_message("assistant") block has completed.
-            # The actual UI elements (st.info, st.spinner, st.markdown, st.json, st.code, st.expander) are rendered 
-            # when they are called. Adding to st.session_state.messages ensures they are part of the scrollback history correctly.
-            # We only need to add the *data* that the history rendering loop uses.
-            
-        # This should be outside the `with st.chat_message("assistant")` block if that block only handles immediate display
+        # Append the assistant_response_message to the main messages list for history scrollback.
+        # This dictionary contains all pieces of data needed by the history rendering loop.
+        # It's populated *during* the `with st.chat_message("assistant")` block.
         st.session_state.messages.append({"role": "assistant", **assistant_response_message})
         # Streamlit reruns, redrawing messages

@@ -108,6 +108,7 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
         perform_search_this_turn = False
         query_for_general_searches = "" 
         raw_user_query_for_qa = ""      
+        actual_search_term = "" # Initialize actual_search_term
         
         # Capture if this turn is considered the "first query" for response formatting purposes
         expect_json_response_this_turn = st.session_state.is_first_query
@@ -122,22 +123,29 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
             perform_search_this_turn = True
             actual_search_term = prompt[len("search "):].strip()
             if not actual_search_term:
-                with st.chat_message("assistant"):
-                    st.warning("Please provide a query after 'search '.")
-                st.session_state.messages.append({"role": "assistant", "content": "Please provide a query after 'search '.", "type": "info"})
-                st.stop() 
-            
-            query_for_general_searches = actual_search_term 
-            raw_user_query_for_qa = actual_search_term      
+                # This warning will be displayed within the upcoming assistant message block
+                pass # Handled in the with st.chat_message("assistant") block
+            else:
+                query_for_general_searches = actual_search_term 
+                raw_user_query_for_qa = actual_search_term      
         else: 
             # No st.info here for "Using existing context", it will be part of assistant's message if no search
 
         # Perform operations within the assistant's chat message context where appropriate
         with st.chat_message("assistant"):
+            # Display informational messages based on search type for this turn
             if st.session_state.is_first_query and perform_search_this_turn:
                 st.info("Applying initial context scaffold for Pinecone searches (first query of session).")
             elif prompt.lower().startswith("search ") and perform_search_this_turn:
-                st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
+                if not actual_search_term: # Handle empty search term case here
+                    st.warning("Please provide a query after 'search '.")
+                    # Store this warning in the message history and stop further processing for this turn.
+                    assistant_response_message["type"] = "info" # Mark as an info/warning message
+                    assistant_response_message["final_llm_output"] = "Please provide a query after 'search ' to initiate a new search."
+                    st.session_state.messages.append({"role": "assistant", **assistant_response_message})
+                    st.stop() # Stop processing for this turn
+                else:
+                    st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
             elif not perform_search_this_turn and not (prompt.strip().lower() == "new") : # Avoid double message for "new"
                  st.info("Using existing Pinecone context. To force a new search, prefix your query with 'search '.")
 
@@ -170,6 +178,8 @@ if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <q
                 except Exception as e:
                     st.error(f"Error during Pinecone search: {e}")
                     assistant_response_message["error_message"] = f"Error during Pinecone search: {e}"
+                    # No need to append to messages here, it will be done at the end of the main 'else' block
+                    # However, we do need to store the error in the assistant_response_message for history
                     st.session_state.messages.append({"role": "assistant", **assistant_response_message})
                     st.stop() 
 

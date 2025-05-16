@@ -54,7 +54,7 @@ openai_api_key_input = st.sidebar.text_input(
 
 # --- Main App ---
 st.title("Interactive RFP Agent")
-st.caption("Answering your RFP questions using Pinecone and OpenAI.")
+st.caption("Answering your RFP questions. Type 'new' to reset. First query gets JSON, follow-ups are conversational. Prefix with 'search ' for new Pinecone search.")
 
 # Initialize RFPQueryEngine
 engine = None
@@ -72,11 +72,15 @@ else:
     st.warning("Please provide Pinecone API Key and Host URL in the sidebar to start.")
     st.stop()
 
-# Initialize chat history and first query flag in session state
+# Initialize session state variables
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "is_first_query" not in st.session_state:
+if "is_first_query" not in st.session_state: # True for the first query of a session
     st.session_state.is_first_query = True
+if "last_pinecone_context" not in st.session_state:
+    st.session_state.last_pinecone_context = ""
+if "llm_conversation_history" not in st.session_state:
+    st.session_state.llm_conversation_history = ""
 
 # Display chat messages from history
 for message in st.session_state.messages:
@@ -84,97 +88,171 @@ for message in st.session_state.messages:
         if message["role"] == "user":
             st.markdown(message["content"])
         elif message["role"] == "assistant":
-            if "pinecone_results_str" in message:
-                with st.expander("View Pinecone Search Results", expanded=False):
-                    st.markdown(message["pinecone_results_str"])
-            
-            if "final_json_response_str" in message and message["final_json_response_str"]:
-                st.markdown("##### Synthesized JSON Response")
-                try:
-                    # Attempt to parse and display as formatted JSON
-                    json_data = json.loads(message["final_json_response_str"])
-                    st.json(json_data)
-                except json.JSONDecodeError:
-                    # If not valid JSON, display as code block
-                    st.code(message["final_json_response_str"], language="text")
-            elif "error_message" in message:
-                 st.error(message["error_message"])
+            if message.get("type") == "info": 
+                st.info(message["content"])
+            else:
+                if "pinecone_results_str" in message and message["pinecone_results_str"]:
+                    with st.expander("View Pinecone Search Results", expanded=False):
+                        st.markdown(message["pinecone_results_str"])
+                
+                # Adaptive display of LLM response based on whether JSON was expected
+                if message.get("is_first_query_response"): # Check if this response was for a first query
+                    st.markdown("##### Synthesized JSON Response")
+                    if "final_llm_output" in message and message["final_llm_output"]:
+                        try:
+                            json_data = json.loads(message["final_llm_output"])
+                            st.json(json_data)
+                        except json.JSONDecodeError:
+                            st.code(message["final_llm_output"], language="text")
+                elif "final_llm_output" in message and message["final_llm_output"]:
+                    st.markdown("##### Agent's Response")
+                    st.markdown(message["final_llm_output"]) # Display as markdown for conversational follow-ups
+                
+                if "error_message" in message: # Ensure errors are always shown
+                    st.error(message["error_message"])
 
 
 # Get user input
-if prompt := st.chat_input("Ask about Totogi's capabilities..."):
+if prompt := st.chat_input("Ask about Totogi... (Type 'new' to reset; 'search <query>' to force search)"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Assistant's turn
-    with st.chat_message("assistant"):
+    if prompt.strip().lower() == "new":
+        st.session_state.is_first_query = True
+        st.session_state.last_pinecone_context = ""
+        st.session_state.llm_conversation_history = ""
+        with st.chat_message("assistant"):
+            st.info("Context reset. First query will expect JSON. Ready for a new query session.")
+        st.session_state.messages.append({"role": "assistant", "content": "Context reset. First query will expect JSON. Ready for a new query session.", "type": "info"})
+    
+    else: 
         assistant_response_message = {}
+        perform_search_this_turn = False
+        query_for_general_searches = "" 
+        raw_user_query_for_qa = ""      
         
-        raw_user_query_for_qa = prompt
-        query_for_general_searches = prompt
+        # Capture if this turn is considered the "first query" for response formatting purposes
+        expect_json_response_this_turn = st.session_state.is_first_query
+        assistant_response_message["is_first_query_response"] = expect_json_response_this_turn
 
         if st.session_state.is_first_query:
+            perform_search_this_turn = True
+            st.info("Applying initial context scaffold for Pinecone searches (first query of session).")
             query_for_general_searches = SCAFFOLDING_PROMPT_FOR_PINECONE_TEMPLATE.replace(SCAFFOLDING_PLACEHOLDER, prompt)
-            st.info(f"Applying initial context scaffold for Pinecone searches (this happens only on the first query).")
-            st.session_state.is_first_query = False
-
-        pinecone_results_str = ""
-        final_json_str = ""
-        error_msg = None
-
-        try:
-            with st.spinner("Searching Pinecone..."):
-                all_search_results = engine.search(query_for_general_searches, raw_user_query_for_qa)
-                pinecone_results_str = format_results_for_display(all_search_results)
+            raw_user_query_for_qa = prompt 
+        elif prompt.lower().startswith("search "): 
+            perform_search_this_turn = True
+            actual_search_term = prompt[len("search "):].strip()
+            if not actual_search_term:
+                with st.chat_message("assistant"):
+                    st.warning("Please provide a query after 'search '.")
+                st.session_state.messages.append({"role": "assistant", "content": "Please provide a query after 'search '.", "type": "info"})
+                st.stop() 
             
-            assistant_response_message["pinecone_results_str"] = pinecone_results_str
-            with st.expander("View Pinecone Search Results (Current Query)", expanded=True):
-                st.markdown(pinecone_results_str)
+            st.info(f"Performing new Pinecone search for: '{actual_search_term}'")
+            query_for_general_searches = actual_search_term 
+            raw_user_query_for_qa = actual_search_term      
+        else: 
+            st.info("Using existing Pinecone context. To force a new search, prefix your query with 'search '.")
 
-            if openai_api_key_input:
-                with st.spinner("Synthesizing final JSON response with OpenAI..."):
-                    pinecone_context_str = ""
+        if perform_search_this_turn:
+            try:
+                with st.spinner("Searching Pinecone..."):
+                    all_search_results = engine.search(query_for_general_searches, raw_user_query_for_qa)
+                    current_pinecone_results_for_display = format_results_for_display(all_search_results)
+                    new_pinecone_context_for_llm = ""
                     for search_name, data_items in all_search_results.items():
-                        pinecone_context_str += f"\nContext from '{search_name}':\n"
+                        new_pinecone_context_for_llm += f"\nContext from '{search_name}':\n"
                         if data_items:
                             for i, data_item in enumerate(data_items, 1):
                                 content = getattr(data_item, 'text', "")
                                 metadata = getattr(data_item, 'metadata', {})
-                                # Try to find a meaningful source identifier
                                 source = metadata.get('source') or metadata.get('filename') or metadata.get('title') or search_name
-                                pinecone_context_str += f"  Result {i} (source: {source}): {content}\n"
+                                new_pinecone_context_for_llm += f"  Result {i} (source: {source}): {content}\n"
                         else:
-                            pinecone_context_str += "  No results found.\n"
+                            new_pinecone_context_for_llm += "  No results found.\n"
+                    st.session_state.last_pinecone_context = new_pinecone_context_for_llm
+                    assistant_response_message["pinecone_results_str"] = current_pinecone_results_for_display
+                    # No need to display Pinecone results immediately here if it's done in the history loop
+                    # However, for user experience, showing it in an expander for the current turn is good.
+                    # This expander will be shown *before* the LLM response for the current turn.
+                    if current_pinecone_results_for_display: # Only show if there are results
+                        with st.expander("View Pinecone Search Results (Current Query)", expanded=True):
+                            st.markdown(current_pinecone_results_for_display)
+                    
+                    # CRITICAL: Set is_first_query to False *after* a successful search for the first query has completed.
+                    if st.session_state.is_first_query: 
+                        st.session_state.is_first_query = False
 
-                    final_json_str = get_final_llm_response(
-                        FINAL_LLM_SYSTEM_PROMPT,
-                        prompt, # Original user prompt for this turn's final synthesis
-                        pinecone_context_str,
+            except Exception as e:
+                st.error(f"Error during Pinecone search: {e}")
+                assistant_response_message["error_message"] = f"Error during Pinecone search: {e}"
+                st.session_state.messages.append({"role": "assistant", **assistant_response_message})
+                st.stop() 
+
+        llm_input_user_requirement = st.session_state.llm_conversation_history
+        if llm_input_user_requirement:
+            llm_input_user_requirement += "\n\n"
+        llm_input_user_requirement += f"User: {prompt}"
+
+        llm_output_str = ""
+        with st.chat_message("assistant"):
+            if openai_api_key_input:
+                if not st.session_state.last_pinecone_context and not perform_search_this_turn:
+                    st.warning("No Pinecone context from previous searches is available. LLM response may be general.")
+                
+                current_llm_system_prompt = FINAL_LLM_SYSTEM_PROMPT if expect_json_response_this_turn else ""
+
+                with st.spinner("Synthesizing final response with OpenAI..."):
+                    llm_output_str = get_final_llm_response(
+                        current_llm_system_prompt,
+                        llm_input_user_requirement, 
+                        st.session_state.last_pinecone_context, 
                         openai_api_key_input
                     )
                 
-                assistant_response_message["final_json_response_str"] = final_json_str
-                st.markdown("##### Synthesized JSON Response")
-                try:
-                    json_data = json.loads(final_json_str)
-                    st.json(json_data)
-                except json.JSONDecodeError:
-                    st.code(final_json_str, language="text") # Display as raw text if not valid JSON
+                assistant_response_message["final_llm_output"] = llm_output_str
+                
+                # Adaptive display for the current turn being processed
+                if expect_json_response_this_turn:
+                    st.markdown("##### Synthesized JSON Response") 
+                    try:
+                        json_data = json.loads(llm_output_str)
+                        st.json(json_data)
+                    except json.JSONDecodeError:
+                        st.code(llm_output_str, language="text")
+                else:
+                    st.markdown("##### Agent's Response") 
+                    st.markdown(llm_output_str)
+
             else:
-                st.warning("OpenAI API Key not provided in sidebar. Skipping final JSON synthesis.")
-                final_json_str = "OpenAI API Key not provided. Cannot generate final JSON response."
-                assistant_response_message["final_json_response_str"] = final_json_str
+                st.warning("OpenAI API Key not provided. Skipping final synthesis.")
+                llm_output_str = "OpenAI API Key not provided. Cannot generate final response."
+                assistant_response_message["final_llm_output"] = llm_output_str
+                # Display this warning directly
+                if expect_json_response_this_turn:
+                    st.markdown("##### Synthesized JSON Response") 
+                    st.code(llm_output_str, language="text")
+                else:
+                    st.markdown("##### Agent's Response") 
+                    st.markdown(llm_output_str)
 
-
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-            error_msg = f"An error occurred during processing: {e}"
-            assistant_response_message["error_message"] = error_msg
+        # Update LLM conversation history
+        agent_explanation_for_history = "LLM response not processed or explanation unavailable."
+        if llm_output_str:
+            if expect_json_response_this_turn:
+                try:
+                    parsed_json = json.loads(llm_output_str)
+                    if isinstance(parsed_json, dict):
+                        agent_explanation_for_history = parsed_json.get("explanation", "No explanation in JSON.")
+                    else: 
+                        agent_explanation_for_history = str(parsed_json) 
+                except json.JSONDecodeError:
+                    agent_explanation_for_history = llm_output_str # Use raw string if not JSON
+            else: # For conversational follow-ups, the whole output is the explanation
+                agent_explanation_for_history = llm_output_str
         
-        st.session_state.messages.append({
-            "role": "assistant", 
-            **assistant_response_message
-        })
-        # Streamlit automatically re-runs from top to bottom on widget interaction,
-        # so messages will be displayed. 
+        st.session_state.llm_conversation_history = llm_input_user_requirement + f"\nAgent: {agent_explanation_for_history}"
+        st.session_state.messages.append({"role": "assistant", **assistant_response_message})
+        # Streamlit reruns, redrawing messages

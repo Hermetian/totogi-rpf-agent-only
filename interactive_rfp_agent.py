@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from typing import List, Dict, Any, Optional, Type
+import json # Added import
 
 import requests
 import openai # type: ignore
@@ -59,10 +60,14 @@ FINAL_LLM_SYSTEM_PROMPT = """You are an expert telecommunications consultant. Ba
 Your response MUST be in valid JSON format with the following structure:
 {
   "compliance": "Fully Compliant" OR "Partially Compliant" OR "Not Compliant",
-  "explanation": "A brief explanation of how Totogi can or cannot support the requirement",
+  "explanation": "A brief explanation of how Totogi can or cannot support the requirement. Be concise yet comprehensive.",
   "sources": [
-    "Source 1", 
-    "Source 2" 
+    // List 1 to 4 unique source identifiers, ordered from most to least relevant.
+    // Each identifier MUST combine the 'Search Scenario Name' (e.g., "Default Namespace", "QA-Pairs Namespace (Original Query)") 
+    // and its 'Result number' (e.g., 1, 2, 3) from the supporting information.
+    // Format: "Search Scenario Name #". For example: "Default Namespace 3", "QA-Pairs Namespace (Original Query) 1".
+    // Only include a source if it directly supports the explanation.
+    // If fewer than 4 sources are highly relevant, or if some results are significantly more informative than others, list only the most relevant ones.
   ]
 }"""
 
@@ -433,9 +438,11 @@ def main_chat_loop():
     
     print("Welcome to the Interactive RFP Query Agent!")
     print("The agent will search three Pinecone configurations for each query.")
+    print("It will retain conversation context. Type 'new' to reset context and start a new query session.")
     print("Type 'exit' or 'quit' to end the conversation.")
 
     is_first_query = True
+    current_conversation_context = "" # Stores the history of the current conversation session
 
     while True:
         try:
@@ -448,21 +455,39 @@ def main_chat_loop():
             print("Exiting...")
             break
 
+        if user_input.lower() == 'new':
+            current_conversation_context = ""
+            is_first_query = True # Reset for scaffolding on the next actual query
+            print("\nContext has been reset. Starting a new query session.")
+            continue
+
         if not user_input:
             continue
 
         print("\nProcessing your query...")
         
-        raw_user_query_for_qa = user_input # Always use the direct input for this
-        
-        if is_first_query:
-            query_for_general_searches = SCAFFOLDING_PROMPT_FOR_PINECONE_TEMPLATE.replace(SCAFFOLDING_PLACEHOLDER, user_input)
-            print(f"DEBUG: Initial query scaffolded to: \n{query_for_general_searches[:300]}...") # Debug print
-            is_first_query = False
+        # This is the text passed to the final LLM as the "user's requirement"
+        # It includes past context and the current user input.
+        user_requirement_for_llm = (
+            f"{current_conversation_context}\n\nUser: {user_input}"
+            if current_conversation_context
+            else f"User: {user_input}" # Start with "User:" for clarity even on the first turn
+        )
+
+        # This is the query for "QA-Pairs Namespace (Original Query)"
+        # It should reflect the full conversational context.
+        raw_user_query_for_qa_search = user_requirement_for_llm
+
+        # This is the primary query for general searches and HyDE.
+        if is_first_query: # True for the first query after start or after "new"
+            # Apply scaffolding only to the current user_input for the very first query of a session
+            primary_query_for_engine = SCAFFOLDING_PROMPT_FOR_PINECONE_TEMPLATE.replace(SCAFFOLDING_PLACEHOLDER, user_input)
+            print(f"DEBUG: Initial query (scaffolded for general/HyDE): \n{primary_query_for_engine[:300]}...")
         else:
-            query_for_general_searches = user_input
+            # For subsequent queries in a conversation, HyDE and general searches operate on the full context.
+            primary_query_for_engine = user_requirement_for_llm
             
-        all_search_results = engine.search(query_for_general_searches, raw_user_query_for_qa)
+        all_search_results = engine.search(primary_query_for_engine, raw_user_query_for_qa_search)
         formatted_output = format_results_for_display(all_search_results)
         
         print("\n--- Agent Response (Retrieved Pinecone Documents) ---")
@@ -483,16 +508,36 @@ def main_chat_loop():
             else:
                 pinecone_context_str += "  No results found.\n"
         
-        # Use the original user_input for the current turn as the requirement
         final_json_response = get_final_llm_response(
             FINAL_LLM_SYSTEM_PROMPT,
-            user_input, 
+            user_requirement_for_llm, # Pass the full contextual requirement
             pinecone_context_str,
             OPENAI_API_KEY if OPENAI_API_KEY != "YOUR_OPENAI_API_KEY" else None
         )
         
         print("\n--- Synthesized JSON Response (GPT-4.x) ---")
         print(final_json_response)
+
+        # Update conversation history
+        agent_response_summary = "Could not parse agent's explanation from JSON." # Default
+        try:
+            response_data = json.loads(final_json_response)
+            if isinstance(response_data, dict) and "explanation" in response_data:
+                agent_response_summary = response_data["explanation"]
+            elif isinstance(response_data, str): # If LLM failed to produce valid JSON
+                 agent_response_summary = final_json_response 
+        except json.JSONDecodeError:
+            # If JSON parsing fails, use the raw response if it's short, otherwise a placeholder
+            if len(final_json_response) < 250: # Avoid polluting history with very long non-JSON strings
+                agent_response_summary = final_json_response
+            else:
+                agent_response_summary = "Agent provided a detailed response (non-JSON format)."
+        except Exception: # Catch any other unexpected errors during parsing
+            agent_response_summary = "Error parsing agent's response for history."
+
+
+        current_conversation_context += f"\n\nUser: {user_input}\nAgent: {agent_response_summary}"
+        is_first_query = False # Set to False after the first query in a session is processed
 
 # if __name__ == "__main__":
 #     main_chat_loop() 
